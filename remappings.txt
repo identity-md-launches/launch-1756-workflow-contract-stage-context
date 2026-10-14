@@ -1,0 +1,4 @@
+forge-std/=lib/forge-std/src/
+@openzeppelin/=lib/openzeppelin-contracts/
+@limitbreak/creator-token-standards/=lib/creator-token-standards/src/
+@limitbreak/permit-c/=lib/permit-c/src/
