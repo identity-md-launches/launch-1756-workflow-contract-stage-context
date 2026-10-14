@@ -1,0 +1,17 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "VeteransRenderer",
+      "constructorArgs": []
+    },
+    {
+      "contract": "VeteransNFT",
+      "constructorArgs": [
+        "$owner",
+        "$contract:VeteransRenderer"
+      ]
+    }
+  ],
+  "notes": "Describes the accepted VETERANS source in constructor dependency order. VeteransRenderer has no constructor arguments and renders on-chain metadata. VeteransNFT(owner_, renderer_) is the VETERANS ERC721C collection: owner_ is $owner (the collection's explicit owner; never the factory), renderer_ is the renderer deployed before it. VeteransNFT's constructor creates VeteransStaking(nft) and VeteransClaimPool(nft, staking) itself (and the pool creates its WethUnwrapper), binds them as immutables, and sets the ERC-2981 royalty receiver to the pool. Those three contracts are therefore not manifest entries: deploying them separately would create unused duplicates the collection never references. Their addresses are read from VeteransNFT.staking() and VeteransNFT.claimPool() and the SiblingsDeployed event. No constructor calls another contract (the ERC721C validator registration is guarded by an extcodesize check), so the set deploys on an empty chain. Staking and the claim pool have no owner. The treasury beneficiary is fixed in source at 0xEab8865F6Af3a866FEf97a9A776c58aBcB711ab5 and receives no administrative role. Open points for review, not waived by this manifest: (1) the IMD token address is not in the brief; VeteransNFT.mint reverts with NotConfigured until the owner calls configure(imd, staking, claimPool) once after launch (the staking and pool arguments must equal the constructor-deployed siblings, so they confirm wiring and cannot redirect it). This manifest supplies no initialization call and no IMD address. (2) The collection registers Limit Break's default transfer validator but its constructor does not set the royalty-enforcing security policy; the owner must set it on the validator after launch and can replace or disable the validator, so immutable royalty enforcement is not established by deployment. (3) The claim pool holds the 20% mint share as IMD and distributes it alongside ETH royalties, rather than converting it to ETH; ETH royalties are split 600/690 to stakers and 90/690 to treasury. (4) Epochs 1-9 hold 333 mints and epoch 10 holds 336, since 10 x 333 = 3,330 and the brief fixes both 3,333 and ten epochs. (5) Age multipliers refresh on stake, unstake, claim or an explicit refresh call, not automatically at tier boundaries. Policy and signed artifact linkage belong to the publishing, attestation, admission and deployment services; these notes are explanatory and do not authorize additional deployment actions."
+}
