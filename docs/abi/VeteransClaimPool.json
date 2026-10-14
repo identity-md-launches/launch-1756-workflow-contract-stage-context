@@ -202,6 +202,19 @@
   },
   {
     "type": "function",
+    "name": "imdOwed",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "nft",
     "inputs": [],
     "outputs": [
@@ -304,6 +317,13 @@
   },
   {
     "type": "function",
+    "name": "syncImd",
+    "inputs": [],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "totalEthReceived",
     "inputs": [],
     "outputs": [
@@ -368,6 +388,45 @@
     "stateMutability": "view"
   },
   {
+    "type": "function",
+    "name": "unwrapWeth",
+    "inputs": [],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "unwrapper",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "contract WethUnwrapper"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "event",
+    "name": "CarryOverReleased",
+    "inputs": [
+      {
+        "name": "eth",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "imd",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
     "type": "event",
     "name": "Donated",
     "inputs": [
@@ -430,6 +489,31 @@
     "inputs": [
       {
         "name": "amount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "ImdSynced",
+    "inputs": [
+      {
+        "name": "amount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "toStakers",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "toTreasury",
         "type": "uint256",
         "indexed": false,
         "internalType": "uint256"
@@ -507,6 +591,19 @@
     "anonymous": false
   },
   {
+    "type": "event",
+    "name": "WethUnwrapped",
+    "inputs": [
+      {
+        "name": "amount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
     "type": "error",
     "name": "EthTransferFailed",
     "inputs": []
@@ -529,6 +626,11 @@
   {
     "type": "error",
     "name": "NothingOwed",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NothingToSync",
     "inputs": []
   },
   {

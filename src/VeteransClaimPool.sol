@@ -4,7 +4,8 @@ pragma solidity 0.8.26;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import {IVeteransNFT} from "./interfaces/IVeterans.sol";
+import {IVeteransNFT, IWETH} from "./interfaces/IVeterans.sol";
+import {WethUnwrapper} from "./WethUnwrapper.sol";
 
 /// @title VETERANS claim pool — ETH royalties and the 20% IMD mint share, claimable by stakers.
 /// @notice Receives every ERC-2981 royalty payment (6.9% of secondary sales): 0.9/6.9 of each payment is
@@ -12,7 +13,9 @@ import {IVeteransNFT} from "./interfaces/IVeterans.sol";
 ///         fee in IMD and distributes it the same way. Shares are pro-rata by the staking contract's weight
 ///         (staked count × wallet-age multiplier). There is no owner and no admin function.
 /// @dev    Weights are mirrored from the staking contract through `onWeightChange`. Funds that arrive while
-///         total weight is zero are carried into the next distribution.
+///         total weight is zero are carried over and released as soon as weight exists again.
+///         Royalties that a marketplace settles in an ERC-20 are recovered permissionlessly: WETH through
+///         `unwrapWeth()` (becomes an ETH royalty) and IMD through `syncImd()` (treated as an IMD royalty).
 contract VeteransClaimPool is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -23,6 +26,8 @@ contract VeteransClaimPool is ReentrancyGuard {
 
     IVeteransNFT public immutable nft;
     address public immutable staking;
+    /// @notice Helper that turns WETH royalties back into ETH (see `unwrapWeth`).
+    WethUnwrapper public immutable unwrapper;
 
     uint256 public accEthPerWeight;
     uint256 public accImdPerWeight;
@@ -31,6 +36,9 @@ contract VeteransClaimPool is ReentrancyGuard {
     uint256 public imdCarryOver;
     /// @notice Treasury share that could not be pushed (treasury rejected ETH); anyone can flush it.
     uint256 public treasuryOwed;
+    /// @notice IMD the pool owes stakers (carried over, or distributed and not yet claimed). Any IMD balance
+    ///         above it arrived unannounced (e.g. a royalty paid in IMD) and is released by `syncImd()`.
+    uint256 public imdOwed;
 
     uint256 public totalEthReceived;
     uint256 public totalEthToStakers;
@@ -49,6 +57,9 @@ contract VeteransClaimPool is ReentrancyGuard {
     event RoyaltyReceived(address indexed from, uint256 amount, uint256 toStakers, uint256 toTreasury);
     event Donated(address indexed from, uint256 amount);
     event ImdNotified(uint256 amount);
+    event ImdSynced(uint256 amount, uint256 toStakers, uint256 toTreasury);
+    event WethUnwrapped(uint256 amount);
+    event CarryOverReleased(uint256 eth, uint256 imd);
     event TreasuryPaid(uint256 amount);
     event WeightSynced(address indexed wallet, uint256 weight, uint256 totalWeight);
     event EthClaimed(address indexed wallet, uint256 amount);
@@ -59,12 +70,14 @@ contract VeteransClaimPool is ReentrancyGuard {
     error NotNFT();
     error EthTransferFailed();
     error NothingOwed();
+    error NothingToSync();
     error NotConfigured();
 
     constructor(address nft_, address staking_) {
         if (nft_ == address(0) || staking_ == address(0)) revert ZeroAddress();
         nft = IVeteransNFT(nft_);
         staking = staking_;
+        unwrapper = new WethUnwrapper();
     }
 
     // ─────────────────────────────────────── Intake ───────────────────────────────────────
@@ -93,14 +106,36 @@ contract VeteransClaimPool is ReentrancyGuard {
     function notifyImd(uint256 amount) external {
         if (msg.sender != address(nft)) revert NotNFT();
         totalImdReceived += amount;
-        uint256 total = amount + imdCarryOver;
-        if (totalWeight == 0) {
-            imdCarryOver = total;
-        } else {
-            imdCarryOver = 0;
-            accImdPerWeight += total * PRECISION / totalWeight;
-        }
+        imdOwed += amount;
+        _distributeImd(amount);
         emit ImdNotified(amount);
+    }
+
+    /// @notice Releases IMD that reached the pool without `notifyImd` (a royalty settled in IMD, or a plain
+    ///         transfer). Treated like a royalty: 90/690 to the treasury, the rest to stakers. Anyone may call.
+    function syncImd() external nonReentrant {
+        IERC20 token = _imd();
+        uint256 surplus = token.balanceOf(address(this)) - imdOwed;
+        if (surplus == 0) revert NothingToSync();
+        uint256 toTreasury = surplus * TREASURY_ROYALTY_BPS / ROYALTY_BPS;
+        uint256 toStakers = surplus - toTreasury;
+        totalImdReceived += surplus;
+        imdOwed += toStakers;
+        _distributeImd(toStakers);
+        emit ImdSynced(surplus, toStakers, toTreasury);
+        if (toTreasury > 0) token.safeTransfer(TREASURY_WALLET, toTreasury);
+    }
+
+    /// @notice Turns WETH royalties (marketplace offers settle in WETH) into ETH, which then takes the normal
+    ///         royalty path through `receive()`. Anyone may call once the owner has set the WETH address.
+    function unwrapWeth() external nonReentrant {
+        IWETH weth = IWETH(nft.weth());
+        if (address(weth) == address(0)) revert NotConfigured();
+        uint256 amount = weth.balanceOf(address(this));
+        if (amount == 0) revert NothingToSync();
+        IERC20(address(weth)).safeTransfer(address(unwrapper), amount);
+        unwrapper.unwrap(weth, amount);
+        emit WethUnwrapped(amount);
     }
 
     /// @notice Pushes any treasury share that a previous push failed to deliver.
@@ -116,13 +151,17 @@ contract VeteransClaimPool is ReentrancyGuard {
     // ───────────────────────────────────── Weight sync ─────────────────────────────────────
 
     /// @notice Mirrors a staker's weight. Only the staking contract may call it.
+    /// @dev    When weight appears after a period with none, the carried-over funds are released to it.
     function onWeightChange(address wallet, uint256 newWeight) external {
         if (msg.sender != staking) revert NotStaking();
         Account storage a = accounts[wallet];
         _settle(a);
-        totalWeight = totalWeight - a.weight + newWeight;
+        uint256 oldTotal = totalWeight;
+        uint256 newTotal = oldTotal - a.weight + newWeight;
+        totalWeight = newTotal;
         a.weight = newWeight;
-        emit WeightSynced(wallet, newWeight, totalWeight);
+        emit WeightSynced(wallet, newWeight, newTotal);
+        if (oldTotal == 0 && newTotal > 0) _releaseCarryOver(newTotal);
     }
 
     // ─────────────────────────────────────── Claims ───────────────────────────────────────
@@ -152,6 +191,11 @@ contract VeteransClaimPool is ReentrancyGuard {
 
     // ───────────────────────────────────── Internals ──────────────────────────────────────
 
+    function _imd() private view returns (IERC20 token) {
+        token = nft.imd();
+        if (address(token) == address(0)) revert NotConfigured();
+    }
+
     function _distributeEth(uint256 amount) private {
         uint256 total = amount + ethCarryOver;
         if (totalWeight == 0) {
@@ -161,6 +205,28 @@ contract VeteransClaimPool is ReentrancyGuard {
         ethCarryOver = 0;
         totalEthToStakers += total;
         accEthPerWeight += total * PRECISION / totalWeight;
+    }
+
+    function _distributeImd(uint256 amount) private {
+        uint256 total = amount + imdCarryOver;
+        if (totalWeight == 0) {
+            imdCarryOver = total;
+            return;
+        }
+        imdCarryOver = 0;
+        accImdPerWeight += total * PRECISION / totalWeight;
+    }
+
+    function _releaseCarryOver(uint256 weight) private {
+        uint256 eth = ethCarryOver;
+        uint256 imdAmount = imdCarryOver;
+        if (eth == 0 && imdAmount == 0) return;
+        ethCarryOver = 0;
+        imdCarryOver = 0;
+        totalEthToStakers += eth;
+        accEthPerWeight += eth * PRECISION / weight;
+        accImdPerWeight += imdAmount * PRECISION / weight;
+        emit CarryOverReleased(eth, imdAmount);
     }
 
     function _settle(Account storage a) private {
@@ -188,8 +254,8 @@ contract VeteransClaimPool is ReentrancyGuard {
         amount = a.imdAccrued;
         if (amount == 0) return 0;
         a.imdAccrued = 0;
-        IERC20 token = nft.imd();
-        if (address(token) == address(0)) revert NotConfigured();
+        imdOwed -= amount;
+        IERC20 token = _imd();
         emit ImdClaimed(wallet, amount);
         token.safeTransfer(wallet, amount);
     }

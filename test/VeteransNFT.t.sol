@@ -13,6 +13,21 @@ import {IERC2981} from "@openzeppelin/contracts/interfaces/IERC2981.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {Base64} from "@openzeppelin/contracts/utils/Base64.sol";
 
+/// @dev Owner-deployed look-alike that answers the old sibling checks and would keep everything sent to it.
+contract FakeSibling {
+    address public nft;
+    address public staking;
+
+    constructor(address nft_) {
+        nft = nft_;
+        staking = address(this);
+    }
+
+    function notifyReward(uint256) external {}
+    function notifyImd(uint256) external {}
+    receive() external payable {}
+}
+
 contract VeteransNFTTest is VeteransBase {
     // ───────────────────────────── construction & configuration ─────────────────────────────
 
@@ -30,13 +45,86 @@ contract VeteransNFTTest is VeteransBase {
         new VeteransNFT(OWNER, address(0));
     }
 
-    function test_constructor_runsOnEmptyChain() public {
+    function test_constructor_runsOnEmptyChain_andDeploysSiblings() public {
         // The launch rehearses constructors where nothing else exists: no external call may be required.
         VeteransNFT fresh = new VeteransNFT(OWNER, address(0xBEEF));
         assertEq(fresh.owner(), OWNER);
         assertFalse(fresh.isConfigured());
+        // The siblings are created by the constructor and bound forever.
+        VeteransStaking s = VeteransStaking(fresh.staking());
+        VeteransClaimPool p = VeteransClaimPool(payable(fresh.claimPool()));
+        assertGt(address(s).code.length, 0);
+        assertGt(address(p).code.length, 0);
+        assertEq(address(s.nft()), address(fresh));
+        assertEq(address(p.nft()), address(fresh));
+        assertEq(p.staking(), address(s));
+        assertEq(p.unwrapper().pool(), address(p));
+        // Royalties point at the pool from deployment, before any owner action.
+        (address receiver, uint256 amount) = fresh.royaltyInfo(1, 10_000);
+        assertEq(receiver, address(p));
+        assertEq(amount, 690);
+        // Standalone construction of the siblings also needs no external call.
         new VeteransStaking(address(0xBEEF));
         new VeteransClaimPool(address(0xBEEF), address(0xCAFE));
+    }
+
+    function test_configure_rejectsAnySiblingButItsOwn() public {
+        // Mirrors the reviewer's proof: an owner-deployed look-alike that answers nft()/staking() correctly.
+        VeteransNFTTestable fresh = new VeteransNFTTestable(OWNER, address(renderer));
+        FakeSibling fake = new FakeSibling(address(fresh));
+        VeteransStaking otherStaking = new VeteransStaking(address(fresh));
+        VeteransClaimPool otherPool = new VeteransClaimPool(address(fresh), address(otherStaking));
+        address ownStaking = fresh.staking();
+        address ownPool = fresh.claimPool();
+
+        vm.startPrank(OWNER);
+        vm.expectRevert(VeteransNFT.InvalidSibling.selector);
+        fresh.configure(address(imd), address(fake), address(fake));
+        vm.expectRevert(VeteransNFT.InvalidSibling.selector);
+        fresh.configure(address(imd), address(otherStaking), address(otherPool));
+        vm.expectRevert(VeteransNFT.InvalidSibling.selector);
+        fresh.configure(address(imd), ownStaking, address(fake));
+        vm.expectRevert(VeteransNFT.InvalidSibling.selector);
+        fresh.configure(address(imd), address(fake), ownPool);
+        // Only the contracts it deployed itself pass.
+        fresh.configure(address(imd), ownStaking, ownPool);
+        vm.stopPrank();
+        assertEq(address(fresh.imd()), address(imd));
+        (address receiver,) = fresh.royaltyInfo(1, 1 ether);
+        assertEq(receiver, ownPool);
+        assertTrue(receiver != address(fake));
+    }
+
+    function test_renounceOwnership_blockedUntilConfigured() public {
+        VeteransNFTTestable fresh = new VeteransNFTTestable(OWNER, address(renderer));
+        address ownStaking = fresh.staking();
+        address ownPool = fresh.claimPool();
+        vm.prank(OWNER);
+        vm.expectRevert(VeteransNFT.NotConfigured.selector);
+        fresh.renounceOwnership();
+        vm.prank(OWNER);
+        fresh.configure(address(imd), ownStaking, ownPool);
+        vm.prank(OWNER);
+        fresh.renounceOwnership();
+        assertEq(fresh.owner(), address(0));
+    }
+
+    function test_setWeth_onceByOwnerAndMustBeContract() public {
+        vm.prank(alice);
+        vm.expectRevert("Ownable: caller is not the owner");
+        nft.setWeth(address(imd));
+        vm.startPrank(OWNER);
+        vm.expectRevert(VeteransNFT.ZeroAddress.selector);
+        nft.setWeth(address(0));
+        vm.expectRevert(VeteransNFT.NotAContract.selector);
+        nft.setWeth(address(0x1234));
+        vm.expectEmit(true, false, false, false);
+        emit VeteransNFT.WethSet(address(imd));
+        nft.setWeth(address(imd));
+        assertEq(nft.weth(), address(imd));
+        vm.expectRevert(VeteransNFT.AlreadyConfigured.selector);
+        nft.setWeth(address(renderer));
+        vm.stopPrank();
     }
 
     function test_mint_revertsBeforeConfigure() public {
@@ -56,29 +144,27 @@ contract VeteransNFTTest is VeteransBase {
         nft.configure(address(imd), address(staking), address(pool));
     }
 
-    function test_configure_rejectsMismatchedSiblings() public {
+    function test_configure_rejectsForeignSiblingsBadImdAndZero() public {
         VeteransNFTTestable fresh = new VeteransNFTTestable(OWNER, address(renderer));
-        VeteransStaking otherStaking = new VeteransStaking(address(fresh));
+        address ownStaking = fresh.staking();
+        address ownPool = fresh.claimPool();
         vm.startPrank(OWNER);
-        // staking belongs to another collection
+        // siblings of another collection (the fixture's), even though they are genuine contracts
         vm.expectRevert(VeteransNFT.InvalidSibling.selector);
         fresh.configure(address(imd), address(staking), address(pool));
-        // pool points at the wrong staking contract
-        VeteransClaimPool wrongPool = new VeteransClaimPool(address(fresh), address(staking));
-        vm.expectRevert(VeteransNFT.InvalidSibling.selector);
-        fresh.configure(address(imd), address(otherStaking), address(wrongPool));
         // IMD must be a contract
-        VeteransClaimPool okPool = new VeteransClaimPool(address(fresh), address(otherStaking));
-        vm.expectRevert(VeteransNFT.InvalidSibling.selector);
-        fresh.configure(address(0x1234), address(otherStaking), address(okPool));
+        vm.expectRevert(VeteransNFT.NotAContract.selector);
+        fresh.configure(address(0x1234), ownStaking, ownPool);
         // zero addresses
         vm.expectRevert(VeteransNFT.ZeroAddress.selector);
-        fresh.configure(address(0), address(otherStaking), address(okPool));
-        // happy path sets the royalty receiver
-        fresh.configure(address(imd), address(otherStaking), address(okPool));
-        (address receiver, uint256 amount) = fresh.royaltyInfo(1, 10_000);
-        assertEq(receiver, address(okPool));
-        assertEq(amount, 690);
+        fresh.configure(address(0), ownStaking, ownPool);
+        vm.expectRevert(VeteransNFT.ZeroAddress.selector);
+        fresh.configure(address(imd), address(0), ownPool);
+        // happy path
+        vm.expectEmit(true, true, true, true);
+        emit VeteransNFT.Configured(address(imd), ownStaking, ownPool);
+        fresh.configure(address(imd), ownStaking, ownPool);
+        assertTrue(fresh.isConfigured());
         vm.stopPrank();
     }
 
@@ -129,10 +215,9 @@ contract VeteransNFTTest is VeteransBase {
     function test_mint_burnFallsBackToDeadAddressWithoutBurnFunction() public {
         MockIMDNoBurn plain = new MockIMDNoBurn();
         VeteransNFTTestable fresh = new VeteransNFTTestable(OWNER, address(renderer));
-        VeteransStaking s = new VeteransStaking(address(fresh));
-        VeteransClaimPool p = new VeteransClaimPool(address(fresh), address(s));
+        (address s, address p) = (fresh.staking(), fresh.claimPool());
         vm.prank(OWNER);
-        fresh.configure(address(plain), address(s), address(p));
+        fresh.configure(address(plain), s, p);
         plain.mint(alice, 1 ether);
         vm.prank(alice);
         plain.approve(address(fresh), type(uint256).max);
@@ -185,10 +270,9 @@ contract VeteransNFTTest is VeteransBase {
     function test_mint_reentrancyGuarded() public {
         ReentrantIMD evil = new ReentrantIMD();
         VeteransNFTTestable fresh = new VeteransNFTTestable(OWNER, address(renderer));
-        VeteransStaking s = new VeteransStaking(address(fresh));
-        VeteransClaimPool p = new VeteransClaimPool(address(fresh), address(s));
+        (address s, address p) = (fresh.staking(), fresh.claimPool());
         vm.prank(OWNER);
-        fresh.configure(address(evil), address(s), address(p));
+        fresh.configure(address(evil), s, p);
         evil.mint(address(evil), 10 ether);
         evil.mint(alice, 10 ether);
         vm.prank(alice);
@@ -227,10 +311,9 @@ contract VeteransNFTTest is VeteransBase {
 
     function test_productionDifficulty_mintAtTwentyBits() public {
         VeteransNFT prod = new VeteransNFT(OWNER, address(renderer));
-        VeteransStaking s = new VeteransStaking(address(prod));
-        VeteransClaimPool p = new VeteransClaimPool(address(prod), address(s));
+        (address s, address p) = (prod.staking(), prod.claimPool());
         vm.prank(OWNER);
-        prod.configure(address(imd), address(s), address(p));
+        prod.configure(address(imd), s, p);
         vm.prank(alice);
         imd.approve(address(prod), type(uint256).max);
         uint256 nonce = mineNonce(prod, alice, 0);
@@ -345,6 +428,63 @@ contract VeteransNFTTest is VeteransBase {
         vm.prank(market);
         nft.transferFrom(bob, alice, id);
         assertEq(nft.ownerOf(id), alice);
+    }
+
+    function test_plainTransferIntoStaking_isRefused_forHolderAndOperator() public {
+        uint256 id = mintFor(alice);
+        address market = makeAddr("market");
+        vm.prank(alice);
+        nft.setApprovalForAll(market, true);
+
+        // The holder's own plain transferFrom would strand the token: refused.
+        vm.prank(alice);
+        vm.expectRevert(VeteransNFT.UseStakeOrSafeTransfer.selector);
+        nft.transferFrom(alice, address(staking), id);
+        // So would an approved operator's, whatever the validator policy says.
+        vm.prank(market);
+        vm.expectRevert(VeteransNFT.UseStakeOrSafeTransfer.selector);
+        nft.transferFrom(alice, address(staking), id);
+        assertEq(nft.ownerOf(id), alice);
+
+        // safeTransferFrom by the holder stakes and credits the holder.
+        vm.prank(alice);
+        nft.safeTransferFrom(alice, address(staking), id);
+        assertEq(staking.stakerOf(id), alice);
+    }
+
+    function test_blockedOperator_cannotPushTokensIntoStaking() public {
+        uint256 id = mintFor(alice);
+        address market = makeAddr("market");
+        validator.setEnforce(true);
+        vm.prank(alice);
+        nft.setApprovalForAll(market, true);
+        // An operator the policy blocks is blocked on the staking path as well: the bypass is only for the
+        // staking contract itself and the holder's own safe transfer.
+        vm.prank(market);
+        vm.expectRevert(abi.encodeWithSelector(MockValidator.OperatorNotWhitelisted.selector, market));
+        nft.safeTransferFrom(alice, address(staking), id);
+        // A whitelisted operator may stake on the holder's behalf; the stake is credited to the holder.
+        validator.setWhitelisted(market, true);
+        vm.prank(market);
+        nft.safeTransferFrom(alice, address(staking), id);
+        assertEq(staking.stakerOf(id), alice);
+    }
+
+    function test_autoApprovedValidator_cannotMoveStakedTokens() public {
+        uint256[] memory ids = mintMany(alice, 1);
+        stakeAll(alice, ids);
+        // Owner auto-approves the validator as an operator for every holder (an ERC721C feature).
+        vm.prank(OWNER);
+        nft.setAutomaticApprovalOfTransfersFromValidator(true);
+        assertTrue(nft.isApprovedForAll(alice, address(validator)), "applies to ordinary holders");
+        assertFalse(nft.isApprovedForAll(address(staking), address(validator)), "never to the staking contract");
+        vm.prank(address(validator));
+        vm.expectRevert("ERC721: caller is not token owner or approved");
+        nft.transferFrom(address(staking), bob, ids[0]);
+        // The stake ledger stays consistent and the staker can still leave.
+        vm.prank(alice);
+        staking.unstake(ids);
+        assertEq(nft.ownerOf(ids[0]), alice);
     }
 
     function test_stakingTransfers_bypassValidator() public {

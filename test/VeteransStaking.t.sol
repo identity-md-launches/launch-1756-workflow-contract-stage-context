@@ -120,9 +120,10 @@ contract VeteransStakingTest is VeteransBase {
         assertEq(staking.accRewardPerWeight(), 0);
 
         uint256[] memory ids = mintMany(bob, 1);
-        stakeAll(bob, ids);
-        mintFor(alice); // distributes carry + new
+        stakeAll(bob, ids); // first weight releases the carry-over at once
         assertEq(staking.carryOver(), 0);
+        assertEq(staking.pendingReward(bob), 2 * REWARD);
+        mintFor(alice); // distributes new
         assertEq(staking.pendingReward(bob), 3 * REWARD); // 2 mints before bob staked + 1 after
         vm.prank(bob);
         assertEq(staking.claim(), 3 * REWARD);
@@ -134,7 +135,8 @@ contract VeteransStakingTest is VeteransBase {
         uint256[] memory a = mintMany(alice, 1);
         uint256[] memory b = mintMany(bob, 1);
         vm.warp(block.timestamp + 400 days);
-        stakeAll(bob, b); // 8.0x → weight 80
+        stakeAll(bob, b); // 8.0x → weight 80; as the first weight, bob also receives the two carried rewards
+        assertEq(staking.pendingReward(bob), 2 * REWARD);
         // alice is also 400 days old now; re-mint to prove firstSeen doesn't reset.
         stakeAll(alice, a); // 8.0x too
         assertEq(staking.weightOf(alice), 80);
@@ -152,7 +154,8 @@ contract VeteransStakingTest is VeteransBase {
         uint256 carolGain = staking.pendingReward(carol);
         assertApproxEqAbs(gained, REWARD * 160 / 170, 2);
         assertApproxEqAbs(carolGain, REWARD * 10 / 170, 2);
-        assertEq(staking.pendingReward(alice), staking.pendingReward(bob));
+        // Equal weight, equal share of everything after both staked; bob keeps the carried rewards.
+        assertEq(staking.pendingReward(bob) - staking.pendingReward(alice), 2 * REWARD);
     }
 
     function test_rewards_multiplierRefreshesOnInteraction() public {
@@ -192,6 +195,30 @@ contract VeteransStakingTest is VeteransBase {
         assertEq(staking.claim(), 2 * REWARD);
         vm.prank(alice);
         assertEq(staking.claim(), 0);
+    }
+
+    function test_rewards_carriedAfterLastMint_reachTheNextStaker() public {
+        // Everyone unstaked when the final mints happen: their 65% is carried with nothing left to notify.
+        uint256[] memory a = mintMany(alice, 1);
+        stakeAll(alice, a);
+        vm.prank(alice);
+        staking.unstake(a);
+        assertEq(staking.totalWeight(), 0);
+        mintFor(bob);
+        mintFor(bob);
+        assertEq(staking.carryOver(), 2 * REWARD);
+
+        uint256[] memory b = new uint256[](1);
+        b[0] = 2;
+        stakeAll(bob, b); // no notify follows; weight 0 → 10 releases the carry-over
+        assertEq(staking.carryOver(), 0);
+        assertEq(staking.pendingReward(bob), 2 * REWARD);
+        assertEq(staking.pendingReward(alice), REWARD, "alice keeps what she earned while staked");
+        vm.prank(bob);
+        assertEq(staking.claim(), 2 * REWARD);
+        vm.prank(alice);
+        assertEq(staking.claim(), REWARD);
+        assertLe(imd.balanceOf(address(staking)), 2, "nothing stranded");
     }
 
     function test_notifyReward_onlyNFT() public {

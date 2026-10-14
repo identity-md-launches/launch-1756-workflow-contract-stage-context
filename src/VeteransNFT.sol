@@ -10,6 +10,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import {IERC20Burnable, IVeteransClaimPool, IVeteransRenderer, IVeteransStaking} from "./interfaces/IVeterans.sol";
+import {VeteransStaking} from "./VeteransStaking.sol";
+import {VeteransClaimPool} from "./VeteransClaimPool.sol";
 
 /// @title VETERANS — proof-of-work mined ERC721C collection with wallet-age tracking.
 /// @notice 3,333 NFTs mined by submitting a nonce whose wallet-bound keccak hash is below the epoch target.
@@ -17,8 +19,10 @@ import {IERC20Burnable, IVeteransClaimPool, IVeteransRenderer, IVeteransStaking}
 ///         10% treasury / 5% burn. Secondary royalties (6.9%) are enforced through Limit Break's ERC721C
 ///         transfer validator and paid to the claim pool, which forwards the treasury's 0.9% share.
 /// @dev    The economics (price, split, supply, epoch size, difficulty schedule, royalty) are constants.
-///         The owner can only: configure the IMD token and sibling contracts once, manage the ERC721C
-///         transfer validator, and swap the metadata renderer until it is frozen.
+///         The constructor deploys the staking contract and the claim pool itself, so the fee split and the
+///         royalty receiver are fixed at deployment and never chosen by anyone. The owner can only: set the
+///         IMD token once (and the chain's WETH once, for ERC-20 royalties), manage the ERC721C transfer
+///         validator, and swap the metadata renderer until it is frozen.
 contract VeteransNFT is OwnableBasic, ERC721C, ERC2981, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -48,12 +52,15 @@ contract VeteransNFT is OwnableBasic, ERC721C, ERC2981, ReentrancyGuard {
 
     // ───────────────────────────────────────── State ─────────────────────────────────────────
 
+    /// @notice Staking contract that receives the 65% share and tracks wallet weights. Deployed here.
+    address public immutable staking;
+    /// @notice ETH/IMD claim pool that receives the 20% share and all royalties. Deployed here.
+    address public immutable claimPool;
+
     /// @notice IMD token the mint price is paid in. Set once by the owner after launch.
     IERC20 public imd;
-    /// @notice Staking contract that receives the 65% share and tracks wallet weights.
-    address public staking;
-    /// @notice ETH/IMD claim pool that receives the 20% share and all royalties.
-    address public claimPool;
+    /// @notice The chain's wrapped ETH, so the pool can unwrap WETH royalties. Set once by the owner.
+    address public weth;
     /// @notice Metadata renderer; swappable by the owner until `metadataFrozen`.
     IVeteransRenderer public renderer;
     bool public metadataFrozen;
@@ -68,7 +75,9 @@ contract VeteransNFT is OwnableBasic, ERC721C, ERC2981, ReentrancyGuard {
 
     // ───────────────────────────────────────── Events ─────────────────────────────────────────
 
+    event SiblingsDeployed(address indexed staking, address indexed claimPool);
     event Configured(address indexed imd, address indexed staking, address indexed claimPool);
+    event WethSet(address indexed weth);
     event RendererUpdated(address indexed renderer);
     event MetadataFrozen();
     event FirstSeen(address indexed wallet, uint64 timestamp);
@@ -81,42 +90,60 @@ contract VeteransNFT is OwnableBasic, ERC721C, ERC2981, ReentrancyGuard {
     error NotConfigured();
     error AlreadyConfigured();
     error InvalidSibling();
+    error NotAContract();
     error SoldOut();
     error HashAboveTarget(bytes32 hash, uint256 target);
     error NonceAlreadyUsed();
     error NotStakingContract();
     error MetadataIsFrozen();
     error TokenDoesNotExist();
+    error UseStakeOrSafeTransfer();
 
     // ─────────────────────────────────────── Constructor ───────────────────────────────────────
 
     /// @param owner_    Collection owner (transfer-validator admin, one-time configurator). Never the factory.
     /// @param renderer_ Metadata renderer contract (deployed before this one; not called here).
+    /// @dev   Deploys the staking contract and the claim pool and binds them permanently: no call to another
+    ///        contract is made, so the constructor runs on an empty chain.
     constructor(address owner_, address renderer_) ERC721OpenZeppelin("VETERANS", "VETERANS") {
         if (owner_ == address(0) || renderer_ == address(0)) revert ZeroAddress();
         _transferOwnership(owner_);
         renderer = IVeteransRenderer(renderer_);
         emit RendererUpdated(renderer_);
+
+        address staking_ = address(new VeteransStaking(address(this)));
+        address claimPool_ = address(new VeteransClaimPool(address(this), staking_));
+        staking = staking_;
+        claimPool = claimPool_;
+        _setDefaultRoyalty(claimPool_, ROYALTY_BPS);
+        emit SiblingsDeployed(staking_, claimPool_);
     }
 
     // ────────────────────────────────── One-time configuration ─────────────────────────────────
 
-    /// @notice Wires the IMD token, staking contract and claim pool. Callable once, by the owner.
-    /// @dev    The siblings must point back at this collection; the pool must point at the staking contract.
+    /// @notice Sets the IMD token. Callable once, by the owner. `staking_` and `claimPool_` must be the
+    ///         contracts this collection deployed itself (`staking()` / `claimPool()`): they are a confirmation
+    ///         of the handoff, never a choice, so the fee split and royalty receiver cannot be redirected.
     function configure(address imd_, address staking_, address claimPool_) external {
         _requireCallerIsContractOwner();
         if (address(imd) != address(0)) revert AlreadyConfigured();
         if (imd_ == address(0) || staking_ == address(0) || claimPool_ == address(0)) revert ZeroAddress();
-        if (imd_.code.length == 0) revert InvalidSibling();
-        if (IVeteransStaking(staking_).nft() != address(this)) revert InvalidSibling();
-        if (IVeteransClaimPool(claimPool_).nft() != address(this)) revert InvalidSibling();
-        if (IVeteransClaimPool(claimPool_).staking() != staking_) revert InvalidSibling();
+        if (staking_ != staking || claimPool_ != claimPool) revert InvalidSibling();
+        if (imd_.code.length == 0) revert NotAContract();
 
         imd = IERC20(imd_);
-        staking = staking_;
-        claimPool = claimPool_;
-        _setDefaultRoyalty(claimPool_, ROYALTY_BPS);
         emit Configured(imd_, staking_, claimPool_);
+    }
+
+    /// @notice Sets the chain's WETH so `VeteransClaimPool.unwrapWeth()` can convert WETH royalties to ETH.
+    ///         Callable once, by the owner. Until set, WETH royalties simply wait in the pool.
+    function setWeth(address weth_) external {
+        _requireCallerIsContractOwner();
+        if (weth != address(0)) revert AlreadyConfigured();
+        if (weth_ == address(0)) revert ZeroAddress();
+        if (weth_.code.length == 0) revert NotAContract();
+        weth = weth_;
+        emit WethSet(weth_);
     }
 
     /// @notice Replaces the metadata renderer. Disabled forever once `freezeMetadata()` is called.
@@ -133,6 +160,12 @@ contract VeteransNFT is OwnableBasic, ERC721C, ERC2981, ReentrancyGuard {
         _requireCallerIsContractOwner();
         metadataFrozen = true;
         emit MetadataFrozen();
+    }
+
+    /// @notice Ownership cannot be renounced before the IMD token is set, or minting could never start.
+    function renounceOwnership() public override {
+        if (address(imd) == address(0)) revert NotConfigured();
+        super.renounceOwnership();
     }
 
     // ───────────────────────────────────── Proof of work ─────────────────────────────────────
@@ -201,7 +234,7 @@ contract VeteransNFT is OwnableBasic, ERC721C, ERC2981, ReentrancyGuard {
 
     /// @notice Lets the staking contract stamp `firstSeen` for wallets that bought on secondary.
     function recordFirstSeen(address wallet) external {
-        if (msg.sender != staking || staking == address(0)) revert NotStakingContract();
+        if (msg.sender != staking) revert NotStakingContract();
         _recordFirstSeen(wallet);
     }
 
@@ -276,15 +309,32 @@ contract VeteransNFT is OwnableBasic, ERC721C, ERC2981, ReentrancyGuard {
 
     // ───────────────────────────────── ERC721C / ERC2981 glue ─────────────────────────────────
 
-    /// @dev Moving a token into or out of the staking contract never changes its beneficial owner, so it
-    ///      bypasses the royalty-enforcing validator. Every other transfer is validated by ERC721C.
+    /// @notice A plain `transferFrom` into the staking contract would strand the token (no stake record), so
+    ///         only the staking contract itself may move tokens there this way. Use `stake()` or
+    ///         `safeTransferFrom`, which credits the stake through `onERC721Received`.
+    function transferFrom(address from, address to, uint256 tokenId) public override {
+        if (to == staking && msg.sender != staking) revert UseStakeOrSafeTransfer();
+        super.transferFrom(from, to, tokenId);
+    }
+
+    /// @dev Staking never changes a token's beneficial owner, so the paths that create or release a stake
+    ///      record bypass the royalty-enforcing validator: the staking contract moving tokens in or out, and a
+    ///      holder's own `safeTransferFrom` into it. Any other transfer, including an operator moving someone
+    ///      else's token into the staking contract, is validated by ERC721C.
     function _preValidateTransfer(address caller, address from, address to, uint256 tokenId, uint256 value)
         internal
         override
     {
         address staking_ = staking;
-        if (staking_ != address(0) && (from == staking_ || to == staking_)) return;
+        if (from == staking_ || caller == staking_ || (to == staking_ && caller == from)) return;
         super._preValidateTransfer(caller, from, to, tokenId, value);
+    }
+
+    /// @dev The owner's optional automatic approval of the transfer validator never extends to staked tokens:
+    ///      only the staking contract may move what it holds, so the stake ledger cannot be desynchronised.
+    function isApprovedForAll(address owner, address operator) public view override returns (bool) {
+        if (owner == staking) return ERC721.isApprovedForAll(owner, operator);
+        return super.isApprovedForAll(owner, operator);
     }
 
     function supportsInterface(bytes4 interfaceId) public view override(ERC721C, ERC2981) returns (bool) {

@@ -63,6 +63,48 @@ contract VeteransRendererTest is Test {
         }
     }
 
+    function test_epochAttribute_clampsToTenEpochs() public view {
+        bytes32 seed = keccak256("seed");
+        assertEq(renderer.epochOf(1), 1);
+        assertEq(renderer.epochOf(333), 1);
+        assertEq(renderer.epochOf(334), 2);
+        assertEq(renderer.epochOf(3330), 10);
+        assertEq(renderer.epochOf(3331), 10);
+        assertEq(renderer.epochOf(3333), 10);
+        assertTrue(
+            vm.contains(
+                string(renderer.tokenJSON(3330, seed)), '"trait_type":"Epoch","display_type":"number","value":10}'
+            )
+        );
+        assertTrue(
+            vm.contains(
+                string(renderer.tokenJSON(3331, seed)), '"trait_type":"Epoch","display_type":"number","value":10}'
+            )
+        );
+        assertTrue(
+            vm.contains(
+                string(renderer.tokenJSON(3333, seed)), '"trait_type":"Epoch","display_type":"number","value":10}'
+            )
+        );
+        assertFalse(vm.contains(string(renderer.tokenJSON(3333, seed)), '"value":11'));
+    }
+
+    function test_traitOdds_matchDeclaredTableWithinByteGranularity() public view {
+        // Declared background odds per 100: [40, 25, 18, 12, 5]. Over all 256 byte values the real counts
+        // must be 256 × odds / 100 within ±3 (a byte cannot represent hundredths exactly), not the
+        // [120, 66, 36, 24, 10] a `% 100` roll would give.
+        uint256[5] memory counts;
+        for (uint256 b; b < 256; ++b) {
+            counts[renderer.traitsOf(bytes32(b << 248)).background]++;
+        }
+        uint8[5] memory odds = [40, 25, 18, 12, 5];
+        for (uint256 i; i < 5; ++i) {
+            assertApproxEqAbs(counts[i], 256 * uint256(odds[i]) / 100, 3);
+        }
+        assertLt(counts[0], 110);
+        assertGt(counts[4], 10);
+    }
+
     function test_hashControlsTraitsNotTokenId() public view {
         bytes32 seed = keccak256("x");
         assertEq(renderer.svg(renderer.traitsOf(seed)), renderer.svg(renderer.traitsOf(seed)));

@@ -6,6 +6,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 /// @notice Subset of the VETERANS NFT surface the staking and claim-pool contracts rely on.
 interface IVeteransNFT {
     function imd() external view returns (IERC20);
+    function weth() external view returns (address);
     function staking() external view returns (address);
     function claimPool() external view returns (address);
     function firstSeen(address wallet) external view returns (uint64);
@@ -33,6 +34,11 @@ interface IVeteransClaimPool {
 /// @notice Optional ERC20 burn extension; the NFT tries it before falling back to a dead-address transfer.
 interface IERC20Burnable {
     function burn(uint256 amount) external;
+}
+
+/// @notice Wrapped-ETH surface the claim pool needs to turn ERC-20 royalties back into ETH.
+interface IWETH is IERC20 {
+    function withdraw(uint256 amount) external;
 }
 
 /// @notice Pure metadata renderer; the NFT delegates tokenURI to it.

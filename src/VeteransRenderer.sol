@@ -13,6 +13,8 @@ contract VeteransRenderer {
     using Strings for uint256;
 
     uint256 public constant EPOCH_SIZE = 333;
+    /// @dev The collection has exactly ten epochs; the last one runs to the supply cap (tokens 3331–3333).
+    uint256 public constant EPOCH_COUNT = 10;
     uint256 public constant OVERCLOCK_ODDS = 24; // ~1 in 24
 
     struct Traits {
@@ -44,8 +46,10 @@ contract VeteransRenderer {
         score += t.overclocked ? 10_000 * OVERCLOCK_ODDS / 10 : 10_000 * OVERCLOCK_ODDS / (10 * (OVERCLOCK_ODDS - 1));
     }
 
+    /// @dev Maps the byte onto 0..99 by scaling (not `% 100`, which would favour residues 0..55), so the
+    ///      declared per-100 odds are the real odds up to the 1/256 granularity of a byte.
     function _pick(uint8 roll, uint8[5] memory odds) private pure returns (uint8) {
-        uint256 r = roll % 100;
+        uint256 r = uint256(roll) * 100 / 256;
         uint256 acc;
         for (uint8 i; i < 5; ++i) {
             acc += odds[i];
@@ -131,11 +135,18 @@ contract VeteransRenderer {
             ",",
             _attr("Tier", t.overclocked ? "Overclocked" : "Veteran"),
             ',{"trait_type":"Epoch","display_type":"number","value":',
-            ((tokenId - 1) / EPOCH_SIZE + 1).toString(),
+            epochOf(tokenId).toString(),
             '},{"trait_type":"Rarity Score","display_type":"number","value":',
             rarityScore(seed).toString(),
             "}]"
         );
+    }
+
+    /// @notice 1-based epoch a token was mined in, clamped to the tenth epoch like `VeteransNFT.currentEpoch`.
+    function epochOf(uint256 tokenId) public pure returns (uint256) {
+        uint256 e = (tokenId - 1) / EPOCH_SIZE;
+        if (e >= EPOCH_COUNT) e = EPOCH_COUNT - 1;
+        return e + 1;
     }
 
     function _attr(string memory key, string memory value) private pure returns (bytes memory) {

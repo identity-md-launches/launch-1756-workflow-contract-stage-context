@@ -12,7 +12,8 @@ import {IVeteransClaimPool, IVeteransNFT} from "./interfaces/IVeterans.sol";
 ///         weight = stakedCount × ageMultiplier(wallet). No lock: stake and unstake at any time.
 /// @dev    The multiplier is refreshed whenever the wallet stakes, unstakes, claims, or anyone calls
 ///         `refresh(wallet)`. Between refreshes the last recorded multiplier applies. Rewards that arrive
-///         while nothing is staked are carried into the next distribution. The contract has no owner.
+///         while nothing is staked are carried over and released as soon as weight exists again. The
+///         contract has no owner; the NFT deploys it in its constructor, so its address is `nft.staking()`.
 contract VeteransStaking is IERC721Receiver, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -223,11 +224,19 @@ contract VeteransStaking is IERC721Receiver, ReentrancyGuard {
         uint256 newWeight = uint256(s.count) * currentMultiplier(wallet);
         if (newWeight != oldWeight) {
             s.weight = uint128(newWeight);
-            totalWeight = totalWeight - oldWeight + newWeight;
-            emit WeightUpdated(wallet, newWeight, totalWeight);
-            address pool = nft.claimPool();
-            if (pool == address(0)) revert NotConfigured();
-            IVeteransClaimPool(pool).onWeightChange(wallet, newWeight);
+            uint256 oldTotal = totalWeight;
+            uint256 newTotal = oldTotal - oldWeight + newWeight;
+            totalWeight = newTotal;
+            emit WeightUpdated(wallet, newWeight, newTotal);
+            // Weight appeared after a period with none: release what was carried over (otherwise rewards
+            // carried after the final mint could never be distributed, since nothing would notify again).
+            if (oldTotal == 0 && newTotal > 0 && carryOver > 0) {
+                uint256 carried = carryOver;
+                carryOver = 0;
+                accRewardPerWeight += carried * PRECISION / newTotal;
+                emit RewardNotified(0, carried, 0);
+            }
+            IVeteransClaimPool(nft.claimPool()).onWeightChange(wallet, newWeight);
         }
     }
 }

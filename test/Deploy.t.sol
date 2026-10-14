@@ -16,10 +16,16 @@ contract DeployTest is Test {
         assertEq(d.nft.owner(), OWNER, "owner is the launch owner, not the deployer");
         assertTrue(d.nft.owner() != address(script));
         assertEq(address(d.nft.renderer()), address(d.renderer));
+        // Siblings are deployed and bound by the NFT's constructor.
+        assertEq(address(d.staking), d.nft.staking());
+        assertEq(address(d.pool), d.nft.claimPool());
         assertEq(address(d.staking.nft()), address(d.nft));
         assertEq(address(d.pool.nft()), address(d.nft));
         assertEq(d.pool.staking(), address(d.staking));
         assertFalse(d.nft.isConfigured());
+        (address receiver, uint256 amount) = d.nft.royaltyInfo(1, 10_000);
+        assertEq(receiver, address(d.pool));
+        assertEq(amount, 690);
 
         // The owner's single post-launch step.
         MockIMD imd = new MockIMD();
@@ -27,18 +33,14 @@ contract DeployTest is Test {
         d.nft.configure(address(imd), address(d.staking), address(d.pool));
         assertTrue(d.nft.isConfigured());
         assertEq(address(d.nft.imd()), address(imd));
-        assertEq(d.nft.staking(), address(d.staking));
-        assertEq(d.nft.claimPool(), address(d.pool));
-        (address receiver, uint256 amount) = d.nft.royaltyInfo(1, 10_000);
-        assertEq(receiver, address(d.pool));
-        assertEq(amount, 690);
     }
 
     function test_runtimeHasNoForbiddenOpcodes() public {
         DeployVeterans script = new DeployVeterans();
         DeployVeterans.Deployment memory d = script.deploy(OWNER);
-        address[4] memory apps = [address(d.renderer), address(d.nft), address(d.staking), address(d.pool)];
-        for (uint256 i; i < 4; ++i) {
+        address[5] memory apps =
+            [address(d.renderer), address(d.nft), address(d.staking), address(d.pool), address(d.pool.unwrapper())];
+        for (uint256 i; i < 5; ++i) {
             bytes memory code = apps[i].code;
             assertGt(code.length, 0);
             assertLe(code.length, 24_576, "EIP-170");
@@ -51,5 +53,7 @@ contract DeployTest is Test {
                 assertTrue(op != 0xf4 && op != 0xf2 && op != 0xff, "DELEGATECALL/CALLCODE/SELFDESTRUCT");
             }
         }
+        // The launched initcode (NFT including the siblings it creates) stays under EIP-3860's 49,152 bytes.
+        assertLe(type(VeteransNFT).creationCode.length + 64, 49_152, "EIP-3860");
     }
 }

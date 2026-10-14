@@ -34,8 +34,8 @@ abstract contract VeteransBase is Test {
         imd = new MockIMD();
         renderer = new VeteransRenderer();
         nft = new VeteransNFTTestable(OWNER, address(renderer));
-        staking = new VeteransStaking(address(nft));
-        pool = new VeteransClaimPool(address(nft), address(staking));
+        staking = VeteransStaking(nft.staking());
+        pool = VeteransClaimPool(payable(nft.claimPool()));
 
         // Limit Break's default validator exists on Robinhood Chain; stand it in with a mock here.
         MockValidator impl = new MockValidator();
@@ -58,11 +58,23 @@ abstract contract VeteransBase is Test {
     }
 
     /// @dev Finds a nonce that satisfies the current target for `miner`, starting from `start`.
+    /// @dev Hashes in a fixed scratch buffer (same layout as `abi.encodePacked(chainid, nft, miner, nonce)`)
+    ///      so a long search, such as the production 20-bit schedule, does not grow memory per attempt.
     function mineNonce(VeteransNFT target, address miner, uint256 start) internal view returns (uint256 nonce) {
         uint256 t = target.target();
+        address self = address(target);
+        uint256 chainId = block.chainid;
         nonce = start;
         while (true) {
-            bytes32 h = keccak256(abi.encodePacked(block.chainid, address(target), miner, nonce));
+            bytes32 h;
+            assembly ("memory-safe") {
+                let p := mload(0x40)
+                mstore(p, chainId)
+                mstore(add(p, 0x20), shl(96, self))
+                mstore(add(p, 0x34), shl(96, miner))
+                mstore(add(p, 0x48), nonce)
+                h := keccak256(p, 0x68)
+            }
             if (uint256(h) < t && !target.nonceUsed(miner, nonce)) return nonce;
             ++nonce;
         }

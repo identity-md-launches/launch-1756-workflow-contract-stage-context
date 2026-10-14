@@ -12,9 +12,9 @@ import {VeteransClaimPool} from "../src/VeteransClaimPool.sol";
 /// @dev    Order and constructor arguments (what the manifest encodes):
 ///           1. VeteransRenderer()                      — no arguments
 ///           2. VeteransNFT(owner, renderer)            — $owner, $contract:VeteransRenderer
-///           3. VeteransStaking(nft)                    — $contract:VeteransNFT
-///           4. VeteransClaimPool(nft, staking)         — $contract:VeteransNFT, $contract:VeteransStaking
-///         After launch the owner calls `VeteransNFT.configure(imd, staking, claimPool)` once.
+///         VeteransNFT's constructor deploys VeteransStaking and VeteransClaimPool itself; read their
+///         addresses from `nft.staking()` and `nft.claimPool()` (also in the `SiblingsDeployed` event).
+///         After launch the owner calls `VeteransNFT.configure(imd, nft.staking(), nft.claimPool())` once.
 contract DeployVeterans is Script {
     struct Deployment {
         VeteransRenderer renderer;
@@ -23,12 +23,12 @@ contract DeployVeterans is Script {
         VeteransClaimPool pool;
     }
 
-    /// @notice Deploys the four contracts for `owner`. Pure function of its arguments, tested directly.
+    /// @notice Deploys the collection for `owner`. Pure function of its arguments, tested directly.
     function deploy(address owner) public returns (Deployment memory d) {
         d.renderer = new VeteransRenderer();
         d.nft = new VeteransNFT(owner, address(d.renderer));
-        d.staking = new VeteransStaking(address(d.nft));
-        d.pool = new VeteransClaimPool(address(d.nft), address(d.staking));
+        d.staking = VeteransStaking(d.nft.staking());
+        d.pool = VeteransClaimPool(payable(d.nft.claimPool()));
     }
 
     /// @notice Rehearsal entry point: `VETERANS_OWNER` must be set; broadcasting is the operator's choice.
