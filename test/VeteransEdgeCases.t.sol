@@ -7,6 +7,7 @@ import {VeteransStaking} from "../src/VeteransStaking.sol";
 import {VeteransClaimPool} from "../src/VeteransClaimPool.sol";
 import {VeteransNFTTestable} from "./harness/VeteransNFTTestable.sol";
 import {MockValidator} from "./mocks/MockValidator.sol";
+import {MockWETH} from "./mocks/MockWETH.sol";
 import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 
 /// @dev Miner contract with no ERC721 receiver hook: `_safeMint` must reject it.
@@ -285,18 +286,26 @@ contract VeteransEdgeCasesTest is VeteransBase {
         uint256 wB = staking.weightOf(bob);
         assertEq(wA, uint256(countA) * staking.multiplierForAge(uint256(ageA) + ageB));
         assertEq(wB, uint256(countB) * staking.multiplierForAge(ageB));
-        // Their own mint fees were carried over (nothing was staked) and fold into the next distribution.
-        assertEq(staking.carryOver(), (uint256(countA) + countB) * REWARD);
-        assertEq(staking.pendingReward(alice) + staking.pendingReward(bob), 0);
+        // Both wallets' own mint fees were carried over (nothing was staked). The first weight to appear, alice's,
+        // releases the whole carry-over to her alone; bob, staking second, gets none of it.
+        uint256 carried = (uint256(countA) + countB) * REWARD;
+        assertEq(staking.carryOver(), 0, "carry-over released at the first stake");
+        assertApproxEqAbs(staking.pendingReward(alice), carried, 1);
+        assertEq(staking.pendingReward(bob), 0);
+        uint256 baseA = staking.pendingReward(alice);
         mintFor(carol);
-        uint256 total = (uint256(countA) + countB + 1) * REWARD;
-        uint256 gainA = staking.pendingReward(alice);
+        uint256 gainA = staking.pendingReward(alice) - baseA;
         uint256 gainB = staking.pendingReward(bob);
-        assertApproxEqAbs(gainA, total * wA / (wA + wB), 2);
-        assertApproxEqAbs(gainB, total * wB / (wA + wB), 2);
-        assertLe(gainA + gainB, total);
-        assertGe(gainA + gainB + 2, total);
+        assertApproxEqAbs(gainA, REWARD * wA / (wA + wB), 2);
+        assertApproxEqAbs(gainB, REWARD * wB / (wA + wB), 2);
+        assertLe(gainA + gainB, REWARD);
+        assertGe(gainA + gainB + 2, REWARD);
         assertEq(staking.carryOver(), 0);
+        // The pool's IMD share follows the same rule: carried shares to alice, the new one split by weight.
+        assertApproxEqAbs(
+            pool.pendingImd(alice), (uint256(countA) + countB) * IMD_SHARE + IMD_SHARE * wA / (wA + wB), 2
+        );
+        assertApproxEqAbs(pool.pendingImd(bob), IMD_SHARE * wB / (wA + wB), 2);
     }
 
     /// @dev A wallet that has aged (8x) outweighs a new one by exactly the table ratio.
@@ -341,9 +350,16 @@ contract VeteransEdgeCasesTest is VeteransBase {
         assertEq(staking.weightOf(address(miner)), 10);
         assertEq(staking.totalWeight(), 10);
         assertEq(pool.totalWeight(), 10);
-        // The fee of that very mint was split before the hook ran, so it was carried over, not credited.
-        assertEq(staking.carryOver(), REWARD);
-        assertEq(staking.pendingReward(address(miner)), 0);
+        // The fee of that very mint was split before the hook ran (nothing staked → carried over); the stake
+        // inside the hook is the first weight to appear, so the carry-over is released to the miner at once.
+        assertEq(staking.carryOver(), 0);
+        assertEq(staking.pendingReward(address(miner)), REWARD);
+        assertEq(pool.imdCarryOver(), 0);
+        assertEq(pool.pendingImd(address(miner)), IMD_SHARE);
+        // And it can be claimed: the hook did not leave the staking ledger in a half-settled state.
+        vm.prank(address(miner));
+        assertEq(staking.claim(), REWARD);
+        assertEq(imd.balanceOf(address(staking)), 0);
     }
 
     function test_mint_insufficientBalanceReverts() public {
@@ -415,12 +431,20 @@ contract VeteransEdgeCasesTest is VeteransBase {
 
     function test_configure_rejectsPoolOfAnotherCollection() public {
         VeteransNFTTestable fresh = new VeteransNFTTestable(OWNER, address(renderer));
+        // Look-alike siblings that even point back at `fresh`: still not the ones its constructor deployed.
         VeteransStaking s = new VeteransStaking(address(fresh));
-        // pool.nft() is the original collection, pool.staking() is `s`: second sibling check fails.
-        VeteransClaimPool foreign = new VeteransClaimPool(address(nft), address(s));
+        VeteransClaimPool foreign = new VeteransClaimPool(address(fresh), address(s));
+        address ownStaking = fresh.staking();
+        address ownPool = fresh.claimPool();
         vm.prank(OWNER);
         vm.expectRevert(VeteransNFT.InvalidSibling.selector);
         fresh.configure(address(imd), address(s), address(foreign));
+        vm.prank(OWNER);
+        vm.expectRevert(VeteransNFT.InvalidSibling.selector);
+        fresh.configure(address(imd), ownStaking, address(foreign));
+        vm.prank(OWNER);
+        vm.expectRevert(VeteransNFT.InvalidSibling.selector);
+        fresh.configure(address(imd), address(s), ownPool);
         vm.prank(OWNER);
         vm.expectRevert(VeteransNFT.ZeroAddress.selector);
         fresh.configure(address(imd), address(0), address(foreign));
@@ -432,9 +456,16 @@ contract VeteransEdgeCasesTest is VeteransBase {
 
     function test_configure_rejectsEoaAsStaking() public {
         VeteransNFTTestable fresh = new VeteransNFTTestable(OWNER, address(renderer));
+        address ownStaking = fresh.staking();
+        address ownPool = fresh.claimPool();
         vm.prank(OWNER);
-        vm.expectRevert(); // staking_.nft() call to an EOA has no return data
-        fresh.configure(address(imd), alice, address(pool));
+        vm.expectRevert(VeteransNFT.InvalidSibling.selector);
+        fresh.configure(address(imd), alice, ownPool);
+        // The sibling check runs before the IMD code check, so an EOA token is only rejected once they match.
+        vm.prank(OWNER);
+        vm.expectRevert(VeteransNFT.NotAContract.selector);
+        fresh.configure(bob, ownStaking, ownPool);
+        assertFalse(fresh.isConfigured());
     }
 
     function test_setTransferValidator_requiresCode() public {
@@ -454,11 +485,15 @@ contract VeteransEdgeCasesTest is VeteransBase {
         vm.stopPrank();
     }
 
-    function test_royaltyInfo_isZeroBeforeConfigure() public {
+    /// @dev The royalty receiver is bound to the pool the constructor deployed, before and regardless of configure.
+    function test_royaltyInfo_isBoundToOwnPoolBeforeConfigure() public {
         VeteransNFTTestable fresh = new VeteransNFTTestable(OWNER, address(renderer));
         (address receiver, uint256 amount) = fresh.royaltyInfo(1, 1 ether);
-        assertEq(receiver, address(0));
-        assertEq(amount, 0);
+        assertEq(receiver, fresh.claimPool());
+        assertTrue(receiver != address(pool), "each collection has its own pool");
+        assertEq(amount, 0.069 ether);
+        assertEq(VeteransClaimPool(payable(receiver)).staking(), fresh.staking());
+        assertEq(address(VeteransClaimPool(payable(receiver)).nft()), address(fresh));
     }
 
     /// @dev Owner power the README must disclose: auto-approving the validator makes it an operator for everyone.
@@ -557,16 +592,162 @@ contract VeteransEdgeCasesTest is VeteransBase {
         assertEq(pool.ethCarryOver(), 1 ether);
         assertEq(pool.imdCarryOver(), IMD_SHARE);
         uint256[] memory b = mintMany(bob, 1);
+        assertEq(pool.imdCarryOver(), 2 * IMD_SHARE);
+        assertEq(staking.carryOver(), 2 * REWARD);
         stakeAll(bob, b);
-        // Carry-overs are folded at the next distribution, not at weight changes.
-        assertEq(pool.pendingEth(bob), 0);
-        assertEq(pool.pendingImd(bob), 0);
+        // The first weight to appear releases every carry-over (ETH, pool IMD and staking IMD) to that staker.
+        assertEq(pool.ethCarryOver(), 0);
+        assertEq(pool.imdCarryOver(), 0);
+        assertEq(staking.carryOver(), 0);
+        assertEq(pool.pendingEth(bob), 1 ether);
+        assertEq(pool.pendingImd(bob), 2 * IMD_SHARE);
+        assertEq(staking.pendingReward(bob), 2 * REWARD);
+        assertEq(pool.totalEthToStakers(), 1 ether);
+        // Later arrivals are distributed normally.
         pool.donate{value: 1}();
         assertEq(pool.pendingEth(bob), 1 ether + 1);
         mintFor(alice);
         assertEq(pool.pendingImd(bob), 3 * IMD_SHARE);
-        assertEq(pool.ethCarryOver(), 0);
-        assertEq(pool.imdCarryOver(), 0);
+        assertEq(staking.pendingReward(bob), 3 * REWARD);
+        // Bob leaving and alice arriving: the second "first staker" gets no carry-over, there is none.
+        vm.prank(bob);
+        staking.unstake(b);
+        assertEq(pool.totalWeight(), 0);
+        uint256[] memory a = new uint256[](1);
+        a[0] = 1;
+        stakeAll(alice, a);
+        assertEq(pool.pendingEth(alice), 0);
+        assertEq(pool.pendingImd(alice), 0);
+        assertEq(staking.pendingReward(alice), 0);
+        assertEq(pool.pendingEth(bob), 1 ether + 1, "leaving forfeits nothing");
+    }
+
+    /// @dev A second dry spell: funds carried after everyone unstaked go to whoever restakes first, and only once.
+    function test_carryOver_afterEveryoneUnstakes_goesToNextStakerOnce() public {
+        uint256[] memory a = mintMany(alice, 1);
+        stakeAll(alice, a); // alice's own mint share was carried and is released to her here
+        vm.prank(alice);
+        staking.unstake(a);
+        uint256 aliceReward = staking.pendingReward(alice);
+        uint256 aliceImd = pool.pendingImd(alice);
+        assertEq(aliceReward, REWARD);
+        assertEq(aliceImd, IMD_SHARE);
+        mintFor(carol); // nobody staked: carried
+        pool.donate{value: 2 ether}();
+        assertEq(staking.carryOver(), REWARD);
+        assertEq(pool.ethCarryOver(), 2 ether);
+        uint256[] memory b = mintMany(bob, 1); // carried too
+        stakeAll(bob, b);
+        assertEq(staking.pendingReward(bob), 2 * REWARD);
+        assertEq(pool.pendingEth(bob), 2 ether);
+        assertEq(pool.pendingImd(bob), 2 * IMD_SHARE);
+        stakeAll(alice, a);
+        assertEq(staking.pendingReward(alice), aliceReward, "nothing left to release");
+        assertEq(pool.pendingImd(alice), aliceImd);
+        assertEq(pool.pendingEth(alice), 0);
+        vm.prank(bob);
+        assertEq(staking.claim(), 2 * REWARD);
+        vm.prank(bob);
+        (uint256 eth, uint256 imdAmt) = pool.claimAll();
+        assertEq(eth, 2 ether);
+        assertEq(imdAmt, 2 * IMD_SHARE);
+    }
+
+    // ───────────────────────────── ERC-20 royalty recovery: failure paths ─────────────────────────────
+
+    function test_syncImd_oneWei_goesEntirelyToStakers() public {
+        uint256[] memory a = mintMany(alice, 1);
+        stakeAll(alice, a);
+        uint256 treasuryBefore = imd.balanceOf(TREASURY);
+        imd.mint(address(pool), 1);
+        pool.syncImd();
+        assertEq(imd.balanceOf(TREASURY), treasuryBefore, "90/690 of one wei rounds to zero");
+        assertEq(pool.pendingImd(alice), IMD_SHARE + 1);
+        assertEq(pool.imdOwed(), IMD_SHARE + 1);
+    }
+
+    /// @dev Stray IMD can never be mistaken for owed IMD, and owed IMD can never be synced away: the surplus is
+    ///      exactly what arrived unannounced, whatever stakers are still owed.
+    function testFuzz_syncImd_onlyReleasesTheSurplus(uint96 stray, uint8 mints) public {
+        mints = uint8(bound(mints, 1, 6));
+        uint256[] memory a = mintMany(alice, 1);
+        stakeAll(alice, a);
+        for (uint256 i; i < mints; ++i) {
+            mintFor(bob);
+        }
+        uint256 owedBefore = pool.imdOwed();
+        assertEq(owedBefore, (uint256(mints) + 1) * IMD_SHARE);
+        if (stray == 0) {
+            vm.expectRevert(VeteransClaimPool.NothingToSync.selector);
+            pool.syncImd();
+            return;
+        }
+        imd.mint(address(pool), stray);
+        uint256 treasuryBefore = imd.balanceOf(TREASURY);
+        pool.syncImd();
+        uint256 toTreasury = uint256(stray) * 90 / 690;
+        assertEq(imd.balanceOf(TREASURY) - treasuryBefore, toTreasury);
+        assertEq(pool.imdOwed(), owedBefore + stray - toTreasury);
+        assertEq(imd.balanceOf(address(pool)), pool.imdOwed(), "nothing unannounced is left");
+        assertApproxEqAbs(pool.pendingImd(alice), pool.imdOwed(), 2);
+        vm.prank(alice);
+        uint256 got = pool.claimImd();
+        assertApproxEqAbs(got, owedBefore + stray - toTreasury, 2);
+        assertLe(imd.balanceOf(address(pool)), 2, "only accumulator dust stays");
+    }
+
+    /// @dev Owner power the README must disclose: `setWeth` is the only external dependency the pool trusts.
+    ///      Pointing it at a token without `withdraw` (here the IMD token itself, which the pool holds for
+    ///      stakers) reverts the whole unwrap, so the stakers' IMD is never moved to the unwrapper.
+    function test_unwrapWeth_withTokenLackingWithdraw_revertsAndMovesNothing() public {
+        uint256[] memory a = mintMany(alice, 1);
+        stakeAll(alice, a);
+        mintFor(bob);
+        uint256 held = imd.balanceOf(address(pool));
+        assertGt(held, 0);
+        vm.prank(OWNER);
+        nft.setWeth(address(imd));
+        vm.expectRevert();
+        pool.unwrapWeth();
+        assertEq(imd.balanceOf(address(pool)), held, "stakers' IMD untouched");
+        assertEq(imd.balanceOf(address(pool.unwrapper())), 0);
+        assertEq(pool.pendingImd(alice), 2 * IMD_SHARE);
+        vm.prank(OWNER);
+        vm.expectRevert(VeteransNFT.AlreadyConfigured.selector);
+        nft.setWeth(address(imd)); // and the mistake is permanent: WETH royalties can then never be unwrapped
+    }
+
+    function test_unwrapWeth_oneWei_goesEntirelyToStakers() public {
+        MockWETH weth = new MockWETH();
+        vm.prank(OWNER);
+        nft.setWeth(address(weth));
+        uint256[] memory a = mintMany(alice, 1);
+        stakeAll(alice, a);
+        vm.deal(address(this), 1);
+        weth.deposit{value: 1}();
+        weth.transfer(address(pool), 1);
+        uint256 treasuryBefore = TREASURY.balance;
+        pool.unwrapWeth();
+        assertEq(TREASURY.balance, treasuryBefore);
+        assertEq(pool.pendingEth(alice), 1);
+        assertEq(address(pool).balance, 1);
+        assertEq(address(pool.unwrapper()).balance, 0);
+    }
+
+    /// @dev WETH that arrives while nobody is staked is unwrapped into the ETH carry-over, not lost.
+    function test_unwrapWeth_withoutStakers_carriesOver() public {
+        MockWETH weth = new MockWETH();
+        vm.prank(OWNER);
+        nft.setWeth(address(weth));
+        vm.deal(address(this), 6.9 ether);
+        weth.deposit{value: 6.9 ether}();
+        weth.transfer(address(pool), 6.9 ether);
+        pool.unwrapWeth();
+        assertEq(pool.ethCarryOver(), 6 ether);
+        assertEq(TREASURY.balance, 0.9 ether);
+        uint256[] memory a = mintMany(alice, 1);
+        stakeAll(alice, a);
+        assertEq(pool.pendingEth(alice), 6 ether);
     }
 
     /// @dev Documented limit: a royalty pushed with the 2,300-gas `transfer` stipend bounces because `receive()`

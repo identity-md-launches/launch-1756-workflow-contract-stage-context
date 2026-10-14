@@ -7,6 +7,7 @@ import {VeteransStaking} from "../../src/VeteransStaking.sol";
 import {VeteransClaimPool} from "../../src/VeteransClaimPool.sol";
 import {VeteransRenderer} from "../../src/VeteransRenderer.sol";
 import {MockIMD} from "../mocks/MockIMD.sol";
+import {MockWETH} from "../mocks/MockWETH.sol";
 import {MockValidator} from "../mocks/MockValidator.sol";
 import {VeteransHandler} from "./VeteransHandler.sol";
 
@@ -34,14 +35,18 @@ contract VeteransInvariantsTest is Test {
         imd = new MockIMD();
         VeteransRenderer renderer = new VeteransRenderer();
         nft = new VeteransNFTTestable(OWNER, address(renderer));
-        staking = new VeteransStaking(address(nft));
-        pool = new VeteransClaimPool(address(nft), address(staking));
+        // The NFT deploys its own siblings; configure() only confirms them.
+        staking = VeteransStaking(nft.staking());
+        pool = VeteransClaimPool(payable(nft.claimPool()));
         MockValidator impl = new MockValidator();
         vm.etch(nft.DEFAULT_TRANSFER_VALIDATOR(), address(impl).code);
-        vm.prank(OWNER);
+        MockWETH weth = new MockWETH();
+        vm.startPrank(OWNER);
         nft.configure(address(imd), address(staking), address(pool));
+        nft.setWeth(address(weth));
+        vm.stopPrank();
 
-        handler = new VeteransHandler(imd, nft, staking, pool);
+        handler = new VeteransHandler(imd, weth, nft, staking, pool);
         initialImdSupply = imd.totalSupply();
         targetContract(address(handler));
     }
@@ -77,16 +82,23 @@ contract VeteransInvariantsTest is Test {
         assertLe(held - owed, _dustBound(), "staking holds IMD nobody can claim");
     }
 
-    /// @notice Same for the pool's IMD share.
+    /// @notice Same for the pool's IMD share. IMD that arrived unannounced and is not yet synced sits on top of
+    ///         what is owed; the `imdOwed` ledger must be exactly the balance minus that stray amount, so a sync
+    ///         can never release owed funds and owed funds can never hide stray ones.
     function invariant_poolImdSolvent() public view {
         address[] memory a = _actors();
         uint256 owed = pool.imdCarryOver();
         for (uint256 i; i < a.length; ++i) {
             owed += pool.pendingImd(a[i]);
         }
-        uint256 held = imd.balanceOf(address(pool));
+        uint256 balance = imd.balanceOf(address(pool));
+        uint256 stray = handler.ghost_strayImd();
+        assertGe(balance, stray, "stray IMD is part of the balance");
+        uint256 held = balance - stray;
         assertGe(held, owed, "pool owes more IMD than it holds");
         assertLe(held - owed, _dustBound(), "pool holds IMD nobody can claim");
+        assertEq(pool.imdOwed(), held, "imdOwed ledger is balance minus unsynced IMD");
+        assertGe(pool.imdOwed(), owed, "imdOwed below what stakers can claim");
     }
 
     /// @notice The pool's ETH covers every staker's pending ETH, the carry-over and the treasury share it could
@@ -114,10 +126,15 @@ contract VeteransInvariantsTest is Test {
     function invariant_feeSplitConservation() public view {
         uint256 minted = nft.totalMinted();
         assertEq(minted, handler.ghost_mints(), "ghost mint count");
+        uint256 syncedImd = handler.ghost_imdMintedToPool() - handler.ghost_strayImd();
         assertEq(staking.totalRewardsReceived(), minted * 0.04485 ether, "65% to staking");
-        assertEq(pool.totalImdReceived(), minted * 0.0138 ether, "20% to pool");
-        assertEq(imd.balanceOf(TREASURY), minted * 0.0069 ether, "10% to treasury");
-        assertEq(initialImdSupply - imd.totalSupply(), minted * 0.00345 ether, "5% burned");
+        assertEq(pool.totalImdReceived(), minted * 0.0138 ether + syncedImd, "20% to pool, plus synced royalties");
+        assertEq(
+            imd.balanceOf(TREASURY), minted * 0.0069 ether + handler.ghost_treasuryImd(), "10% to treasury + 90/690"
+        );
+        assertEq(
+            initialImdSupply + handler.ghost_imdMintedToPool() - imd.totalSupply(), minted * 0.00345 ether, "5% burned"
+        );
         // What stakers have been paid plus what is still held equals what came in.
         assertEq(
             imd.balanceOf(address(staking)) + handler.ghost_stakingClaimed(),
@@ -125,17 +142,19 @@ contract VeteransInvariantsTest is Test {
             "staking IMD in == held + paid"
         );
         assertEq(
-            imd.balanceOf(address(pool)) + handler.ghost_poolImdClaimed(),
-            pool.totalImdReceived(),
-            "pool IMD in == held + paid"
+            imd.balanceOf(address(pool)) + handler.ghost_poolImdClaimed() + handler.ghost_treasuryImd(),
+            pool.totalImdReceived() + handler.ghost_strayImd(),
+            "pool IMD in == held + paid + treasury"
         );
     }
 
-    /// @notice ETH: royalties split 90/690 to the treasury (held when the push fails), the rest plus donations to
-    ///         stakers; what was paid out never exceeds what was distributed.
+    /// @notice ETH: royalties (direct or unwrapped from WETH) split 90/690 to the treasury (held when the push
+    ///         fails), the rest plus donations to stakers; what was paid out never exceeds what was distributed.
     function invariant_ethConservation() public view {
         uint256 royaltyIn = handler.ghost_royaltyIn();
         uint256 donated = handler.ghost_donated();
+        assertEq(handler.weth().balanceOf(address(pool)), 0, "no WETH left wrapped");
+        assertEq(address(pool.unwrapper()).balance, 0, "unwrapper keeps nothing");
         assertEq(pool.totalEthReceived(), royaltyIn + donated, "totalEthReceived");
         assertEq(TREASURY.balance + pool.treasuryOwed(), handler.ghost_treasuryEth(), "treasury share");
         uint256 toStakers = royaltyIn + donated - handler.ghost_treasuryEth();

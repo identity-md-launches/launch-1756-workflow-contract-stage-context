@@ -6,6 +6,7 @@ import {VeteransNFTTestable} from "../harness/VeteransNFTTestable.sol";
 import {VeteransStaking} from "../../src/VeteransStaking.sol";
 import {VeteransClaimPool} from "../../src/VeteransClaimPool.sol";
 import {MockIMD} from "../mocks/MockIMD.sol";
+import {MockWETH} from "../mocks/MockWETH.sol";
 import {RejectingReceiver} from "../mocks/MockValidator.sol";
 
 /// @dev Drives the whole VETERANS stack with bounded inputs from a fixed set of EOAs. Every action is written
@@ -18,6 +19,7 @@ contract VeteransHandler is Test {
     uint256 internal constant MAX_MINTS = 700;
 
     MockIMD public imd;
+    MockWETH public weth;
     VeteransNFTTestable public nft;
     VeteransStaking public staking;
     VeteransClaimPool public pool;
@@ -28,12 +30,15 @@ contract VeteransHandler is Test {
     // ───────────────────────────── ghost state ─────────────────────────────
     uint256 public ghost_mints;
     uint256 public ghost_calls;
-    uint256 public ghost_royaltyIn; // ETH that went through receive()
+    uint256 public ghost_royaltyIn; // ETH that went through receive(), directly or unwrapped from WETH
     uint256 public ghost_donated; // ETH that went through donate()
     uint256 public ghost_treasuryEth; // Σ royalty * 90 / 690
     uint256 public ghost_stakingClaimed; // IMD paid by staking.claim()
     uint256 public ghost_poolImdClaimed;
     uint256 public ghost_poolEthClaimed;
+    uint256 public ghost_imdMintedToPool; // IMD minted straight to the pool (a royalty settled in IMD)
+    uint256 public ghost_strayImd; // ...of which not yet released by syncImd()
+    uint256 public ghost_treasuryImd; // Σ synced * 90 / 690
     uint256 public ghost_lastAccReward;
     uint256 public ghost_lastAccEth;
     uint256 public ghost_lastAccImd;
@@ -46,8 +51,15 @@ contract VeteransHandler is Test {
     mapping(address => uint256[]) internal _staked;
     mapping(address => uint256) public ghost_weightAtLastRefresh;
 
-    constructor(MockIMD imd_, VeteransNFTTestable nft_, VeteransStaking staking_, VeteransClaimPool pool_) {
+    constructor(
+        MockIMD imd_,
+        MockWETH weth_,
+        VeteransNFTTestable nft_,
+        VeteransStaking staking_,
+        VeteransClaimPool pool_
+    ) {
         imd = imd_;
+        weth = weth_;
         nft = nft_;
         staking = staking_;
         pool = pool_;
@@ -184,6 +196,44 @@ contract VeteransHandler is Test {
         vm.deal(address(this), amount);
         pool.donate{value: amount}();
         ghost_donated += amount;
+    }
+
+    /// @dev A marketplace offer settled in WETH: the royalty lands as WETH and anyone unwraps it into ETH.
+    function wethRoyalty(uint256 amount) external {
+        _tick();
+        amount = bound(amount, 0, 50 ether);
+        vm.deal(address(this), amount);
+        weth.deposit{value: amount}();
+        weth.transfer(address(pool), amount);
+        if (amount == 0) return;
+        pool.unwrapWeth();
+        assertEq(weth.balanceOf(address(pool)), 0, "unwrap must drain the pool's WETH");
+        assertEq(address(pool.unwrapper()).balance, 0, "unwrapper must keep nothing");
+        ghost_royaltyIn += amount;
+        ghost_treasuryEth += amount * 90 / 690;
+    }
+
+    /// @dev A royalty settled in IMD (or any plain transfer): lands unannounced and waits for syncImd().
+    function strayImd(uint256 amount) external {
+        _tick();
+        amount = bound(amount, 0, 50 ether);
+        imd.mint(address(pool), amount);
+        ghost_imdMintedToPool += amount;
+        ghost_strayImd += amount;
+    }
+
+    function syncImd(uint256 callerSeed) external {
+        _tick();
+        uint256 stray = ghost_strayImd;
+        if (stray == 0) {
+            vm.expectRevert(VeteransClaimPool.NothingToSync.selector);
+            pool.syncImd();
+            return;
+        }
+        vm.prank(_actor(callerSeed)); // anyone may sync
+        pool.syncImd();
+        ghost_strayImd = 0;
+        ghost_treasuryImd += stray * 90 / 690;
     }
 
     function claimEth(uint256 actorSeed) external {
