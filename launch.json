@@ -1,0 +1,30 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "VeteransRenderer",
+      "constructorArgs": []
+    },
+    {
+      "contract": "VeteransNFT",
+      "constructorArgs": [
+        "$owner",
+        "$contract:VeteransRenderer"
+      ]
+    },
+    {
+      "contract": "VeteransStaking",
+      "constructorArgs": [
+        "$contract:VeteransNFT"
+      ]
+    },
+    {
+      "contract": "VeteransClaimPool",
+      "constructorArgs": [
+        "$contract:VeteransNFT",
+        "$contract:VeteransStaking"
+      ]
+    }
+  ],
+  "notes": "Describes the four accepted application contracts in constructor dependency order: on-chain metadata renderer, VETERANS ERC721C collection, wallet-age-weighted staking, and ETH/IMD claim pool. The collection's explicit owner is $owner; staking and the claim pool have no owner. The treasury beneficiary is fixed in source at 0xEab8865F6Af3a866FEf97a9A776c58aBcB711ab5 and receives no administrative role. Unresolved source and requirement conflicts remain review findings: (1) VeteransNFT's constructor leaves IMD, staking, claimPool and ERC2981 royalties unconfigured; mint reverts with NotConfigured. The accepted implementation requires an owner-only configure call after deployment, incompatible with this launch's constructor-only setup. No constructor argument can resolve this, and this manifest supplies no initialization call or invented IMD address. (2) The collection uses an external default transfer validator, but its constructor does not configure the required royalty-enforcing security policy; the owner can replace or disable the validator. The manifest does not establish immutable royalty enforcement. (3) The claim pool holds and distributes the 20% mint share as IMD, with no ETH conversion, contrary to the brief's ETH requirement; it separately splits received ETH royalties 600/690 to stakers and 90/690 to treasury. (4) The accepted ten-epoch schedule has nine epochs of 333 mints and a final epoch of 336, rather than 333 mints in every epoch. (5) Stored reward weights refresh on interaction or an explicit refresh, rather than automatically at wallet-age boundaries. These findings are not waived by the manifest. Policy and signed artifact linkage belong to the publishing, attestation, admission and deployment services; these notes are explanatory and do not authorize additional deployment actions."
+}
